@@ -13,6 +13,8 @@
 #include <clocale>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
+#include <numeric>
 #include <fstream>
 #include <mutex>
 #include <set>
@@ -1424,6 +1426,76 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
+    // ---- draft-train dumper (RU-adaptation, _ru_draft/TODO.md R1) ----
+    struct dump_proj_t {
+        uint32_t in_dim = 0, out_dim = 0;
+        float eps = 0.f;
+        std::vector<float> fc;    // [out_dim * in_dim]: y[o] = sum_i fc[o*in_dim + i] * x[i]
+        std::vector<float> norm;  // [out_dim] rms-norm weight
+        bool enabled = false;
+    };
+    bool dump_enabled = !params.dump_file.empty() && !params.dump_layer_inp.empty();
+    dump_proj_t dump_proj;
+    std::ofstream dump_stream;
+    const uint32_t dump_n_embd = dump_enabled ? (uint32_t) llama_model_n_embd(model) : 0;
+    const uint32_t dump_n_vocab = dump_enabled ? (uint32_t) llama_vocab_n_tokens(vocab) : 0;
+    if (dump_enabled) {
+        if (params.n_parallel > 1) {
+            LOG_ERR("%s: --dump-* requires a single sequence (n_parallel == 1)\n", __func__);
+            dump_enabled = false;
+        }
+    }
+    if (dump_enabled) {
+        if (!params.dump_proj_file.empty()) {
+            std::ifstream pf(params.dump_proj_file, std::ios::binary);
+            char magic[4] = {0, 0, 0, 0};
+            uint32_t ver = 0;
+            if (!pf.read(magic, 4) || memcmp(magic, "DFPJ", 4) != 0 || !pf.read((char *)&ver, 4) || ver != 1) {
+                LOG_ERR("%s: bad projection file '%s'\n", __func__, params.dump_proj_file.c_str());
+                return false;
+            }
+            pf.read((char *)&dump_proj.in_dim, 4);
+            pf.read((char *)&dump_proj.out_dim, 4);
+            pf.read((char *)&dump_proj.eps, 4);
+            if (dump_proj.in_dim != params.dump_layer_inp.size() * dump_n_embd) {
+                LOG_ERR("%s: projection in_dim %d != n_layers*n_embd %zu\n", __func__,
+                        (int) dump_proj.in_dim, (size_t) params.dump_layer_inp.size() * dump_n_embd);
+                return false;
+            }
+            dump_proj.fc.resize((size_t) dump_proj.out_dim * dump_proj.in_dim);
+            dump_proj.norm.resize(dump_proj.out_dim);
+            pf.read((char *) dump_proj.fc.data(), dump_proj.fc.size() * 4);
+            pf.read((char *) dump_proj.norm.data(), dump_proj.norm.size() * 4);
+            dump_proj.enabled = true;
+            LOG_INF("%s: dump projection loaded: %d -> %d (rms eps %g)\n", __func__,
+                    (int) dump_proj.in_dim, (int) dump_proj.out_dim, dump_proj.eps);
+        }
+        for (const auto lid : params.dump_layer_inp) {
+            llama_set_embeddings_layer_inp(ctx, lid, true);
+        }
+        dump_stream.open(params.dump_file, std::ios::binary);
+        if (!dump_stream) {
+            LOG_ERR("%s: failed to open dump file '%s'\n", __func__, params.dump_file.c_str());
+            return false;
+        }
+        const char magic[4] = {'D', 'F', 'S', 'H'};
+        const uint32_t ver = 1;
+        const uint32_t n_layers = (uint32_t) params.dump_layer_inp.size();
+        const uint32_t proj_dim = dump_proj.enabled ? dump_proj.out_dim : 0;
+        const uint32_t topk = (uint32_t) std::max(0, params.dump_topk);
+        dump_stream.write(magic, 4);
+        dump_stream.write((const char *)&ver, 4);
+        dump_stream.write((const char *)&n_layers, 4);
+        dump_stream.write((const char *) params.dump_layer_inp.data(), 4 * n_layers);
+        dump_stream.write((const char *)&dump_n_embd, 4);
+        dump_stream.write((const char *)&proj_dim, 4);
+        dump_stream.write((const char *)&topk, 4);
+        dump_stream.write((const char *)&dump_n_vocab, 4);
+        LOG_INF("%s: dump enabled: %d layers, ctx %d, proj %d, topk %d -> '%s'\n", __func__,
+                (int) n_layers, n_ctx, (int) proj_dim, (int) topk, params.dump_file.c_str());
+    }
+    // ---- end dumper setup ----
+
     const bool add_bos = llama_vocab_get_add_bos(vocab);
 
     if (llama_pooling_type(ctx) != LLAMA_POOLING_TYPE_LAST) {
@@ -1537,6 +1609,95 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
 
             if (nextn && !nextn->decode(ctx, batch)) {
                 return false;
+            }
+
+            if (dump_enabled) {
+                llama_synchronize(ctx);
+
+                const uint32_t topk = (uint32_t) std::max(0, params.dump_topk);
+                const size_t n_dump_layers = params.dump_layer_inp.size();
+                const uint32_t feat_dim = dump_proj.enabled ? dump_proj.out_dim : (uint32_t) (n_dump_layers * dump_n_embd);
+
+                const uint32_t n_rec = (uint32_t) batch_size;
+                dump_stream.write((const char *) &n_rec, 4);
+                for (int k = 0; k < batch_size; ++k) {
+                    const int32_t tok = tokens[batch_start + k];
+                    dump_stream.write((const char *) &tok, 4);
+                }
+
+                const float * batch_logits = llama_get_logits(ctx);
+
+                // stage per-token features first (parallel when projecting), then write sequentially
+                std::vector<std::vector<float>> feats(batch_size);
+                {
+                    auto project_one = [&](int k, std::vector<float> & x, std::vector<float> & y) {
+                        for (size_t l = 0; l < n_dump_layers; ++l) {
+                            const float * buf = llama_get_embeddings_layer_inp(ctx, params.dump_layer_inp[l]);
+                            memcpy(x.data() + l * dump_n_embd, buf + (size_t) k * dump_n_embd, dump_n_embd * sizeof(float));
+                        }
+                        if (!dump_proj.enabled) {
+                            y = x;
+                            return;
+                        }
+                        float ms = 0.f;
+                        for (uint32_t o = 0; o < dump_proj.out_dim; ++o) {
+                            const float * w = dump_proj.fc.data() + (size_t) o * dump_proj.in_dim;
+                            float acc = 0.f;
+                            for (uint32_t i = 0; i < dump_proj.in_dim; ++i) {
+                                acc += w[i] * x[i];
+                            }
+                            y[o] = acc;
+                            ms += acc * acc;
+                        }
+                        const float scale = 1.0f / sqrtf(ms / dump_proj.out_dim + dump_proj.eps);
+                        for (uint32_t o = 0; o < dump_proj.out_dim; ++o) {
+                            y[o] = y[o] * scale * dump_proj.norm[o];
+                        }
+                    };
+
+                    const int n_threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
+                    if (dump_proj.enabled && batch_size > 32 && n_threads > 1) {
+                        std::vector<std::thread> th;
+                        for (int t = 0; t < n_threads; ++t) {
+                            th.emplace_back([&, t]() {
+                                std::vector<float> x(n_dump_layers * dump_n_embd);
+                                std::vector<float> y(dump_proj.out_dim);
+                                for (int k = t; k < batch_size; k += n_threads) {
+                                    project_one(k, x, y);
+                                    feats[k] = y;
+                                }
+                            });
+                        }
+                        for (auto & tt : th) { tt.join(); }
+                    } else {
+                        std::vector<float> x(n_dump_layers * dump_n_embd);
+                        std::vector<float> y(dump_proj.enabled ? dump_proj.out_dim : n_dump_layers * dump_n_embd);
+                        for (int k = 0; k < batch_size; ++k) {
+                            project_one(k, x, y);
+                            feats[k] = y;
+                        }
+                    }
+                }
+
+                std::vector<int32_t> top_idx(dump_n_vocab);
+                std::iota(top_idx.begin(), top_idx.end(), 0);
+                for (int k = 0; k < batch_size; ++k) {
+                    if (topk > 0) {
+                        const float * lg = batch_logits + (size_t) k * dump_n_vocab;
+                        std::nth_element(top_idx.begin(), top_idx.begin() + topk, top_idx.end(),
+                                [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
+                        std::sort(top_idx.begin(), top_idx.begin() + topk,
+                                [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
+                        for (uint32_t t = 0; t < topk; ++t) {
+                            dump_stream.write((const char *) &top_idx[t], 4);
+                        }
+                        for (uint32_t t = 0; t < topk; ++t) {
+                            dump_stream.write((const char *) (lg + top_idx[t]), 4);
+                        }
+                    }
+                    dump_stream.write((const char *) feats[k].data(), feat_dim * 4);
+                }
+                dump_stream.flush();
             }
 
             if (params.compute_ppl && num_batches > 1) {

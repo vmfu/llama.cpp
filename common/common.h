@@ -473,6 +473,12 @@ struct common_params {
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
+
+    // draft-train dumper (RU-adaptation): serialize per-token layer inputs + top-k logits
+    std::vector<uint32_t> dump_layer_inp;  // layer ids whose inputs to dump
+    std::string dump_file;                 // output stream (binary)
+    int32_t dump_topk = 64;                // top-k (id, logit) per position (0 = off)
+    std::string dump_proj_file;            // optional side file with frozen fc + rms-norm weights
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)

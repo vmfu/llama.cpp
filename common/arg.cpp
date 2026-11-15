@@ -1723,6 +1723,44 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_chunks = value;
         }
     ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(common_arg(
+        {"--dump-layer-inp"}, "L,L,...",
+        "comma-separated layer ids whose per-token inputs to dump (draft-train)",
+        [](common_params & params, const std::string & value) {
+            params.dump_layer_inp.clear();
+            size_t pos = 0;
+            while (pos <= value.size()) {
+                const size_t comma = value.find(',', pos);
+                const std::string item = value.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!item.empty()) {
+                    params.dump_layer_inp.push_back((uint32_t) std::stoi(item));
+                }
+                if (comma == std::string::npos) { break; }
+                pos = comma + 1;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--dump-file"}, "FNAME",
+        "binary output stream for the layer-input dump (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.dump_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--dump-topk"}, "N",
+        string_format("top-k (id, logit) pairs dumped per position (default: %d, 0 = off)", params.dump_topk),
+        [](common_params & params, int value) {
+            params.dump_topk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--dump-proj"}, "FNAME",
+        "side file with frozen projection (fc + rms-norm) applied on the fly (default: raw concat)",
+        [](common_params & params, const std::string & value) {
+            params.dump_proj_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg({ "-fa", "--flash-attn" }, "[on|off|auto]",
                        string_format("set Flash Attention use ('on', 'off', or 'auto', default: '%s')",
                                      llama_flash_attn_type_name(params.flash_attn_type)),
