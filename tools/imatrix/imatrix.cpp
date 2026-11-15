@@ -1625,8 +1625,6 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
                     dump_stream.write((const char *) &tok, 4);
                 }
 
-                const float * batch_logits = llama_get_logits(ctx);
-
                 // stage per-token features first (parallel when projecting), then write sequentially
                 std::vector<std::vector<float>> feats(batch_size);
                 {
@@ -1683,16 +1681,23 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
                 std::iota(top_idx.begin(), top_idx.end(), 0);
                 for (int k = 0; k < batch_size; ++k) {
                     if (topk > 0) {
-                        const float * lg = batch_logits + (size_t) k * dump_n_vocab;
-                        std::nth_element(top_idx.begin(), top_idx.begin() + topk, top_idx.end(),
-                                [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
-                        std::sort(top_idx.begin(), top_idx.begin() + topk,
-                                [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
-                        for (uint32_t t = 0; t < topk; ++t) {
-                            dump_stream.write((const char *) &top_idx[t], 4);
-                        }
-                        for (uint32_t t = 0; t < topk; ++t) {
-                            dump_stream.write((const char *) (lg + top_idx[t]), 4);
+                        const float * lg = llama_get_logits_ith(ctx, k);
+                        if (lg != nullptr) {
+                            std::nth_element(top_idx.begin(), top_idx.begin() + topk, top_idx.end(),
+                                    [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
+                            std::sort(top_idx.begin(), top_idx.begin() + topk,
+                                    [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
+                            for (uint32_t t = 0; t < topk; ++t) {
+                                dump_stream.write((const char *) &top_idx[t], 4);
+                            }
+                            for (uint32_t t = 0; t < topk; ++t) {
+                                dump_stream.write((const char *) (lg + top_idx[t]), 4);
+                            }
+                        } else {
+                            const int32_t zero = 0;
+                            const float zerof = 0.f;
+                            for (uint32_t t = 0; t < topk; ++t) { dump_stream.write((const char *) &zero, 4); }
+                            for (uint32_t t = 0; t < topk; ++t) { dump_stream.write((const char *) &zerof, 4); }
                         }
                     }
                     dump_stream.write((const char *) feats[k].data(), feat_dim * 4);
