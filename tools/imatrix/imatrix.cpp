@@ -1618,12 +1618,6 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
                 const size_t n_dump_layers = params.dump_layer_inp.size();
                 const uint32_t feat_dim = dump_proj.enabled ? dump_proj.out_dim : (uint32_t) (n_dump_layers * dump_n_embd);
 
-                const uint32_t n_rec = (uint32_t) batch_size;
-                dump_stream.write((const char *) &n_rec, 4);
-                for (int k = 0; k < batch_size; ++k) {
-                    const int32_t tok = tokens[batch_start + k];
-                    dump_stream.write((const char *) &tok, 4);
-                }
 
                 // stage per-token features first (parallel when projecting), then write sequentially
                 std::vector<std::vector<float>> feats(batch_size);
@@ -1677,31 +1671,42 @@ static bool compute_imatrix(llama_context * ctx, const common_params & params, c
                     }
                 }
 
+                // буфер чанка целиком -> один fwrite (никакой потоковой магии)
+                const size_t per_tok = (size_t)(topk * 2 + feat_dim) * 4;
+                std::vector<char> chunk_buf;
+                chunk_buf.reserve(4 + (size_t)batch_size * per_tok);
+                auto put32 = [&chunk_buf](const void * p) {
+                    chunk_buf.insert(chunk_buf.end(), (const char *)p, (const char *)p + 4);
+                };
+                { const uint32_t nb = (uint32_t)batch_size; put32(&nb); }
+                for (int k = 0; k < batch_size; ++k) {
+                    put32(&tokens[batch_start + k]);
+                }
                 std::vector<int32_t> top_idx(dump_n_vocab);
                 std::iota(top_idx.begin(), top_idx.end(), 0);
+                std::vector<float> lg_copy(dump_n_vocab);
                 for (int k = 0; k < batch_size; ++k) {
                     if (topk > 0) {
-                        const float * lg = llama_get_logits_ith(ctx, k);
-                        if (lg != nullptr) {
+                        const float * lg_raw = llama_get_logits_ith(ctx, k);
+                        if (lg_raw != nullptr) {
+                            memcpy(lg_copy.data(), lg_raw, (size_t)dump_n_vocab * 4);
+                            const float * lg = lg_copy.data();
                             std::nth_element(top_idx.begin(), top_idx.begin() + topk, top_idx.end(),
                                     [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
                             std::sort(top_idx.begin(), top_idx.begin() + topk,
                                     [lg](int32_t a, int32_t b) { return lg[a] > lg[b]; });
-                            for (uint32_t t = 0; t < topk; ++t) {
-                                dump_stream.write((const char *) &top_idx[t], 4);
-                            }
-                            for (uint32_t t = 0; t < topk; ++t) {
-                                dump_stream.write((const char *) (lg + top_idx[t]), 4);
-                            }
+                            for (uint32_t q = 0; q < topk; ++q) put32(&top_idx[q]);
+                            for (uint32_t q = 0; q < topk; ++q) put32(lg + top_idx[q]);
                         } else {
-                            const int32_t zero = 0;
-                            const float zerof = 0.f;
-                            for (uint32_t t = 0; t < topk; ++t) { dump_stream.write((const char *) &zero, 4); }
-                            for (uint32_t t = 0; t < topk; ++t) { dump_stream.write((const char *) &zerof, 4); }
+                            const int32_t zi = 0; const float zf = 0.f;
+                            for (uint32_t q = 0; q < topk; ++q) put32(&zi);
+                            for (uint32_t q = 0; q < topk; ++q) put32(&zf);
                         }
                     }
-                    dump_stream.write((const char *) feats[k].data(), feat_dim * 4);
+                    const char * fb = (const char *) feats[k].data();
+                    chunk_buf.insert(chunk_buf.end(), fb, fb + (size_t)feat_dim * 4);
                 }
+                dump_stream.write(chunk_buf.data(), chunk_buf.size());
                 dump_stream.flush();
             }
 
